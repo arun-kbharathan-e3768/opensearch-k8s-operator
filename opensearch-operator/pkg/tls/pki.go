@@ -27,8 +27,7 @@ type Cert interface {
 	SecretData(ca Cert) map[string][]byte
 	KeyData() []byte
 	CertData() []byte
-	CreateAndSignCertificate(commonName string, orgUnit string, dnsnames []string) (cert Cert, err error)
-	CreateAndSignCertificateWithExpiry(commonName string, orgUnit string, dnsnames []string, expiry time.Time) (cert Cert, err error)
+	CreateAndSignCertificate(commonName string, orgUnit string, dnsnames []string, validity time.Duration) (cert Cert, err error)
 }
 
 type CertValidater interface {
@@ -126,7 +125,7 @@ func (cert *PEMCert) CertData() []byte {
 	return cert.certBytes
 }
 
-func (ca *PEMCert) CreateAndSignCertificateWithExpiry(commonName string, orgUnit string, dnsnames []string, expiry time.Time) (cert Cert, err error) {
+func (ca *PEMCert) CreateAndSignCertificate(commonName string, orgUnit string, dnsnames []string, validity time.Duration) (cert Cert, err error) {
 	tlscacert, err := ca.cert()
 	if err != nil {
 		return
@@ -146,6 +145,11 @@ func (ca *PEMCert) CreateAndSignCertificateWithExpiry(commonName string, orgUnit
 		return
 	}
 
+	if validity <= 0 {
+		validity = 365 * 24 * time.Hour
+	}
+	notAfter := time.Now().Add(validity)
+
 	x509cert := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -153,7 +157,7 @@ func (ca *PEMCert) CreateAndSignCertificateWithExpiry(commonName string, orgUnit
 			OrganizationalUnit: []string{orgUnit},
 		},
 		NotBefore:   time.Now(),
-		NotAfter:    expiry,
+		NotAfter:    notAfter,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 	}
@@ -196,10 +200,6 @@ func (ca *PEMCert) CreateAndSignCertificateWithExpiry(commonName string, orgUnit
 	keyBytes := keyPEM.Bytes()
 
 	return &PEMCert{keyBytes: keyBytes, certBytes: certBytes}, nil
-}
-
-func (ca *PEMCert) CreateAndSignCertificate(commonName string, orgUnit string, dnsnames []string) (cert Cert, err error) {
-	return ca.CreateAndSignCertificateWithExpiry(commonName, orgUnit, dnsnames, time.Now().AddDate(1, 0, 0))
 }
 
 func (pki *PkiImpl) CAFromSecret(data map[string][]byte) Cert {
@@ -273,10 +273,6 @@ func (i *implCertValidater) IsExpiringSoon() bool {
 
 func (i *implCertValidater) IsSignedByCA(ca Cert) (bool, error) {
 	block, _ := pem.Decode(ca.CertData())
-	if block == nil {
-		return false, fmt.Errorf("failed to decode CA certificate PEM data")
-	}
-
 	caCert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return false, err

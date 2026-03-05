@@ -7,14 +7,14 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver"
-	opsterv1 "github.com/Opster/opensearch-k8s-operator/opensearch-operator/api/v1"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/opensearch-gateway/services"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/builders"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/helpers"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/util"
-	"github.com/cisco-open/operator-tools/pkg/reconciler"
 	"github.com/go-logr/logr"
+	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/opensearch-gateway/services"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/builders"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/helpers"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconciler"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/util"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +34,7 @@ const (
 	componentNameUpgrader   = "Upgrader"
 	upgradeStatusPending    = "Pending"
 	upgradeStatusInProgress = "Upgrading"
+	upgradeStatusFinished   = "Finished"
 )
 
 type UpgradeReconciler struct {
@@ -42,7 +43,7 @@ type UpgradeReconciler struct {
 	osClient          *services.OsClusterClient
 	recorder          record.EventRecorder
 	reconcilerContext *ReconcilerContext
-	instance          *opsterv1.OpenSearchCluster
+	instance          *opensearchv1.OpenSearchCluster
 	logger            logr.Logger
 }
 
@@ -51,7 +52,7 @@ func NewUpgradeReconciler(
 	ctx context.Context,
 	recorder record.EventRecorder,
 	reconcilerContext *ReconcilerContext,
-	instance *opsterv1.OpenSearchCluster,
+	instance *opensearchv1.OpenSearchCluster,
 	opts ...reconciler.ResourceReconcilerOption,
 ) *UpgradeReconciler {
 	return &UpgradeReconciler{
@@ -67,6 +68,13 @@ func NewUpgradeReconciler(
 func (r *UpgradeReconciler) Reconcile() (ctrl.Result, error) {
 	// If versions are in sync do nothing
 	if r.instance.Spec.General.Version == r.instance.Status.Version {
+		// If phase is UPGRADING but versions are in sync, set it back to RUNNING
+		if r.instance.Status.Phase == opensearchv1.PhaseUpgrading {
+			err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
+				instance.Status.Phase = opensearchv1.PhaseRunning
+			})
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -87,25 +95,39 @@ func (r *UpgradeReconciler) Reconcile() (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
+	// Set phase to UPGRADING if not already set
+	if r.instance.Status.Phase != opensearchv1.PhaseUpgrading {
+		err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
+			instance.Status.Phase = opensearchv1.PhaseUpgrading
+		})
+		if err != nil {
+			r.logger.Error(err, "Could not update status")
+			return ctrl.Result{}, err
+		}
+	}
+
 	var err error
 
 	r.osClient, err = util.CreateClientForCluster(r.client, r.ctx, r.instance, nil)
 	if err != nil {
+		r.logger.Error(err, "Could not create client for cluster")
 		return ctrl.Result{}, err
 	}
 
+	// Start the nodepool upgrade loop
+
 	// Fetch the working nodepool
-	nodePool, currentStatus := r.findNextNodePoolForUpgrade()
+	nodePool, componentStatus := r.findNextNodePoolForUpgrade()
 
 	// Work on the current nodepool as appropriate
-	switch currentStatus.Status {
+	switch componentStatus.Status {
 	case upgradeStatusPending:
 		// Set it to upgrading and requeue
-		err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opsterv1.OpenSearchCluster) {
-			currentStatus.Status = upgradeStatusInProgress
-			instance.Status.ComponentsStatus = append(instance.Status.ComponentsStatus, currentStatus)
+		err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
+			componentStatus.Status = upgradeStatusInProgress
+			instance.Status.ComponentsStatus = append(instance.Status.ComponentsStatus, componentStatus)
 		})
-		r.recorder.AnnotatedEventf(r.instance, annotations, "Normal", "Upgrade", "Starting upgrade of node pool '%s'", currentStatus.Description)
+		r.recorder.AnnotatedEventf(r.instance, annotations, "Normal", "Upgrade", "Starting upgrade of node pool '%s'", componentStatus.Description)
 		return ctrl.Result{
 			Requeue:      true,
 			RequeueAfter: 15 * time.Second,
@@ -116,12 +138,13 @@ func (r *UpgradeReconciler) Reconcile() (ctrl.Result, error) {
 			Requeue:      true,
 			RequeueAfter: 30 * time.Second,
 		}, err
-	case "Finished":
+	case upgradeStatusFinished:
 		// Cleanup status after successful upgrade
-		err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opsterv1.OpenSearchCluster) {
+		err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
 			instance.Status.Version = instance.Spec.General.Version
+			instance.Status.Phase = opensearchv1.PhaseRunning
 			for _, pool := range instance.Spec.NodePools {
-				componentStatus := opsterv1.ComponentStatus{
+				componentStatus := opensearchv1.ComponentStatus{
 					Component:   componentNameUpgrader,
 					Description: pool.Component,
 				}
@@ -156,7 +179,7 @@ func (r *UpgradeReconciler) validateUpgrade() error {
 
 	// Don't allow version downgrades as they might cause unexpected issues
 	if new.LessThan(existing) {
-		r.recorder.AnnotatedEventf(r.instance, annotations, "Error", "Upgrade", "Invalid version: specified version is more than 1 major version greater than existing")
+		r.recorder.AnnotatedEventf(r.instance, annotations, "Error", "Upgrade", "Invalid version: specified version is a downgrade")
 		return ErrVersionDowngrade
 	}
 
@@ -176,9 +199,9 @@ func (r *UpgradeReconciler) validateUpgrade() error {
 }
 
 // Find which nodepool to work on
-func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, opsterv1.ComponentStatus) {
+func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opensearchv1.NodePool, opensearchv1.ComponentStatus) {
 	// First sort node pools
-	var dataNodes, dataAndMasterNodes, otherNodes []opsterv1.NodePool
+	var dataNodes, dataAndMasterNodes, otherNodes []opensearchv1.NodePool
 	for _, nodePool := range r.instance.Spec.NodePools {
 		if helpers.HasDataRole(&nodePool) {
 			if helpers.HasManagerRole(&nodePool) {
@@ -195,7 +218,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	// Complete the in progress node first
 	pool, found := r.findInProgress(dataNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusInProgress,
@@ -204,7 +227,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	// Pick the first unworked on node next
 	pool, found = r.findNextPool(dataNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusPending,
@@ -213,7 +236,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	// Next do the same for any nodes that are data and master
 	pool, found = r.findInProgress(dataAndMasterNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusInProgress,
@@ -221,7 +244,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	}
 	pool, found = r.findNextPool(dataAndMasterNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusPending,
@@ -231,7 +254,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	// Finally do the non data nodes
 	pool, found = r.findInProgress(otherNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusInProgress,
@@ -239,7 +262,7 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	}
 	pool, found = r.findNextPool(otherNodes)
 	if found {
-		return pool, opsterv1.ComponentStatus{
+		return pool, opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: pool.Component,
 			Status:      upgradeStatusPending,
@@ -247,15 +270,15 @@ func (r *UpgradeReconciler) findNextNodePoolForUpgrade() (opsterv1.NodePool, ops
 	}
 
 	// If we get here all nodes should be upgraded
-	return opsterv1.NodePool{}, opsterv1.ComponentStatus{
+	return opensearchv1.NodePool{}, opensearchv1.ComponentStatus{
 		Component: componentNameUpgrader,
-		Status:    "Finished",
+		Status:    upgradeStatusFinished,
 	}
 }
 
-func (r *UpgradeReconciler) findInProgress(pools []opsterv1.NodePool) (opsterv1.NodePool, bool) {
+func (r *UpgradeReconciler) findInProgress(pools []opensearchv1.NodePool) (opensearchv1.NodePool, bool) {
 	for _, nodePool := range pools {
-		componentStatus := opsterv1.ComponentStatus{
+		componentStatus := opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: nodePool.Component,
 		}
@@ -264,12 +287,12 @@ func (r *UpgradeReconciler) findInProgress(pools []opsterv1.NodePool) (opsterv1.
 			return nodePool, true
 		}
 	}
-	return opsterv1.NodePool{}, false
+	return opensearchv1.NodePool{}, false
 }
 
-func (r *UpgradeReconciler) findNextPool(pools []opsterv1.NodePool) (opsterv1.NodePool, bool) {
+func (r *UpgradeReconciler) findNextPool(pools []opensearchv1.NodePool) (opensearchv1.NodePool, bool) {
 	for _, nodePool := range pools {
-		componentStatus := opsterv1.ComponentStatus{
+		componentStatus := opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Description: nodePool.Component,
 		}
@@ -278,10 +301,10 @@ func (r *UpgradeReconciler) findNextPool(pools []opsterv1.NodePool) (opsterv1.No
 			return nodePool, true
 		}
 	}
-	return opsterv1.NodePool{}, false
+	return opensearchv1.NodePool{}, false
 }
 
-func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
+func (r *UpgradeReconciler) doNodePoolUpgrade(pool opensearchv1.NodePool) error {
 	var conditions []string
 	annotations := map[string]string{"cluster-name": r.instance.GetName()}
 	// Fetch the STS
@@ -290,6 +313,12 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 	if err != nil {
 		return err
 	}
+
+	readyReplicas, err := helpers.ReadyReplicasForNodePool(r.client, r.instance, &pool)
+	if err != nil {
+		return err
+	}
+	sts.Status.ReadyReplicas = readyReplicas
 
 	dataCount := util.DataNodesCount(r.client, r.instance)
 	if dataCount == 2 && r.instance.Spec.General.DrainDataNodes {
@@ -301,6 +330,18 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 		conditions = append(conditions, "Waiting for all pods to be ready")
 		r.setComponentConditions(conditions, pool.Component)
 		return nil
+	}
+
+	// Delete deprecated settings that have been archived in the updated version
+	// NOTE: This needs to be called before each pod delete, since some settings are being re-applied automatically during node restart.
+	// NOTE: This can be removed if OpenSearch 2.x stops erroring on archived settings
+	// See https://github.com/opensearch-project/OpenSearch/issues/18515
+	err = services.DeleteUnsupportedClusterSettings(r.osClient, r.instance.Spec.General.Version)
+	if err != nil {
+		r.logger.Error(err, "Could not delete unsupported cluster settings")
+		conditions = append(conditions, "Could not delete unsupported cluster settings")
+		r.setComponentConditions(conditions, pool.Component)
+		return err
 	}
 
 	ready, condition, err := services.CheckClusterStatusForRestart(r.osClient, r.instance.Spec.General.DrainDataNodes)
@@ -323,17 +364,18 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 	// If upgrade on this node pool is complete update status and return
 	if sts.Status.UpdatedReplicas == lo.FromPtrOr(sts.Spec.Replicas, 1) {
 		if err = services.ReactivateShardAllocation(r.osClient); err != nil {
+			r.logger.Error(err, "Could not reactivate shard allocation")
 			return err
 		}
 		r.recorder.AnnotatedEventf(r.instance, annotations, "Normal", "Upgrade", "Finished upgrade of node pool '%s'", pool.Component)
 
-		return r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opsterv1.OpenSearchCluster) {
-			currentStatus := opsterv1.ComponentStatus{
+		return r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
+			currentStatus := opensearchv1.ComponentStatus{
 				Component:   componentNameUpgrader,
 				Status:      upgradeStatusInProgress,
 				Description: pool.Component,
 			}
-			componentStatus := opsterv1.ComponentStatus{
+			componentStatus := opensearchv1.ComponentStatus{
 				Component:   componentNameUpgrader,
 				Status:      "Upgraded",
 				Description: pool.Component,
@@ -344,6 +386,7 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 
 	workingPod, err := helpers.WorkingPodForRollingRestart(r.client, &sts)
 	if err != nil {
+		r.logger.Error(err, "Could not find working pod")
 		conditions = append(conditions, "Could not find working pod")
 		r.setComponentConditions(conditions, pool.Component)
 		return err
@@ -351,6 +394,7 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 
 	ready, err = services.PreparePodForDelete(r.osClient, r.logger, workingPod, r.instance.Spec.General.DrainDataNodes, dataCount)
 	if err != nil {
+		r.logger.Error(err, "Could not prepare pod for delete")
 		conditions = append(conditions, "Could not prepare pod for delete")
 		r.setComponentConditions(conditions, pool.Component)
 		return err
@@ -368,6 +412,7 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 		},
 	})
 	if err != nil {
+		r.logger.Error(err, "Could not delete pod")
 		conditions = append(conditions, "Could not delete pod")
 		r.setComponentConditions(conditions, pool.Component)
 		return err
@@ -378,7 +423,7 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 
 	// If we are draining nodes remove the exclusion after the pod is deleted
 	if r.instance.Spec.General.DrainDataNodes {
-		_, err = services.RemoveExcludeNodeHost(r.osClient, workingPod)
+		_, err = services.RemoveExcludeNodeHost(r.osClient, r.logger, workingPod)
 		return err
 	}
 
@@ -387,14 +432,14 @@ func (r *UpgradeReconciler) doNodePoolUpgrade(pool opsterv1.NodePool) error {
 
 func (r *UpgradeReconciler) setComponentConditions(conditions []string, component string) {
 
-	err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opsterv1.OpenSearchCluster) {
-		currentStatus := opsterv1.ComponentStatus{
+	err := r.client.UpdateOpenSearchClusterStatus(client.ObjectKeyFromObject(r.instance), func(instance *opensearchv1.OpenSearchCluster) {
+		currentStatus := opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Status:      upgradeStatusInProgress,
 			Description: component,
 		}
 		componentStatus, found := helpers.FindFirstPartial(instance.Status.ComponentsStatus, currentStatus, helpers.GetByDescriptionAndComponent)
-		newStatus := opsterv1.ComponentStatus{
+		newStatus := opensearchv1.ComponentStatus{
 			Component:   componentNameUpgrader,
 			Status:      upgradeStatusInProgress,
 			Description: component,

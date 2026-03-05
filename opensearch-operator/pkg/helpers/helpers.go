@@ -1,6 +1,8 @@
 package helpers
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,15 +10,21 @@ import (
 	"log"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/Masterminds/semver"
+	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v2"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	policyv1 "k8s.io/api/policy/v1"
 
-	opsterv1 "github.com/Opster/opensearch-k8s-operator/opensearch-operator/api/v1"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
 	version "github.com/hashicorp/go-version"
+	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,15 +32,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
 	stsUpdateWaitTime = 30
-	updateStepTime    = 3
+	updateStepTime    = 2
 
 	stsRevisionLabel = "controller-revision-hash"
+
+	// Default UID and GID for OpenSearch containers
+	DefaultUID = int64(1000)
+	DefaultGID = int64(1000)
 )
+
+type User struct {
+	Hash         string   `yaml:"hash"`
+	Reserved     bool     `yaml:"reserved"`
+	BackendRoles []string `yaml:"backend_roles,omitempty"`
+	Description  string   `yaml:"description"`
+}
+
+type Meta struct {
+	Type          string `yaml:"type"`
+	ConfigVersion int    `yaml:"config_version"`
+}
+
+type InternalUserConfig struct {
+	Meta         Meta  `yaml:"_meta"`
+	Admin        User  `yaml:"admin"`
+	Kibanaserver *User `yaml:"kibanaserver,omitempty"`
+}
 
 func ContainsString(slice []string, s string) bool {
 	for _, item := range slice {
@@ -43,13 +74,134 @@ func ContainsString(slice []string, s string) bool {
 	return false
 }
 
+// IsHttpTlsEnabled determines if HTTP TLS is enabled for the cluster.
+// If enabled is nil (not set): enabled by default if HTTP config exists.
+// If enabled is true: explicitly enabled.
+// If enabled is false: explicitly disabled.
+func IsHttpTlsEnabled(cluster *opensearchv1.OpenSearchCluster) bool {
+	if cluster == nil {
+		return false
+	}
+	if cluster.Spec.Security == nil || cluster.Spec.Security.Tls == nil {
+		return false
+	}
+	tlsConfig := cluster.Spec.Security.Tls.Http
+	if tlsConfig == nil {
+		return false
+	}
+	// If explicitly set, use that value
+	if tlsConfig.Enabled != nil {
+		return *tlsConfig.Enabled
+	}
+	// Default: enabled if HTTP config is provided
+	return true
+}
+
+func CheckVersionConstraint(cluster *opensearchv1.OpenSearchCluster, constraint string, defaultOnError bool, errMsg string) bool {
+	versionConstraint, err := semver.NewConstraint(constraint)
+	if err != nil {
+		panic(err)
+	}
+
+	version, err := semver.NewVersion(cluster.Spec.General.Version)
+	if err != nil {
+		log.Println(errMsg)
+		return defaultOnError
+	}
+	return versionConstraint.Check(version)
+}
+
+func SecurityChangeVersion(cluster *opensearchv1.OpenSearchCluster) bool {
+	return CheckVersionConstraint(
+		cluster,
+		">=2.0.0",
+		true,
+		"unable to parse version, assuming >= 2.0.0",
+	)
+}
+
+func SupportsHotReload(cluster *opensearchv1.OpenSearchCluster) bool {
+	return CheckVersionConstraint(
+		cluster,
+		">=2.19.1",
+		false,
+		"unable to parse version for hot reload check, assuming not supported",
+	)
+}
+
+// IsTransportTlsEnabled determines if transport TLS should be enabled.
+// If enabled is nil (not set): enabled by default if transport config exists.
+// If enabled is true: explicitly enabled.
+// If enabled is false: explicitly disabled.
+func IsTransportTlsEnabled(cluster *opensearchv1.OpenSearchCluster) bool {
+	if cluster == nil {
+		return false
+	}
+	if cluster.Spec.Security == nil || cluster.Spec.Security.Tls == nil {
+		return false
+	}
+	tlsConfig := cluster.Spec.Security.Tls.Transport
+	if tlsConfig == nil {
+		return false
+	}
+	// If explicitly set, use that value
+	if tlsConfig.Enabled != nil {
+		return *tlsConfig.Enabled
+	}
+	return true
+}
+
+func IsSecurityPluginEnabled(cr *opensearchv1.OpenSearchCluster) bool {
+	if SecurityChangeVersion(cr) {
+		return IsHttpTlsEnabled(cr)
+	}
+	return IsTransportTlsEnabled(cr)
+}
+
+// ClusterURL returns the URL for communicating with the OpenSearch cluster.
+// If OperatorClusterURL is specified, it uses that custom URL.
+// Otherwise, it constructs the default internal Kubernetes service DNS name.
+func ClusterURL(cluster *opensearchv1.OpenSearchCluster) string {
+	if cluster == nil {
+		return ""
+	}
+
+	namespace := cluster.Namespace
+	serviceName := cluster.Spec.General.ServiceName
+	httpPort := cluster.Spec.General.HttpPort
+	operatorClusterURL := cluster.Spec.General.OperatorClusterURL
+
+	if httpPort == 0 {
+		httpPort = 9200 // default port
+	}
+
+	protocol := "https"
+	// Check if HTTP TLS is enabled
+	if !IsHttpTlsEnabled(cluster) {
+		protocol = "http"
+	}
+
+	if operatorClusterURL != nil && *operatorClusterURL != "" {
+		return fmt.Sprintf("%s://%s:%d", protocol, *operatorClusterURL, httpPort)
+	}
+
+	// Default internal Kubernetes service DNS name
+	return fmt.Sprintf("%s://%s.%s.svc.%s:%d",
+		protocol,
+		serviceName,
+		namespace,
+		ClusterDnsBase(),
+		httpPort,
+	)
+}
+
 func GetField(v *appsv1.StatefulSetSpec, field string) interface{} {
 	r := reflect.ValueOf(v)
 	f := reflect.Indirect(r).FieldByName(field).Interface()
 	return f
 }
 
-func RemoveIt(ss opsterv1.ComponentStatus, ssSlice []opsterv1.ComponentStatus) []opsterv1.ComponentStatus {
+func RemoveIt(ss opensearchv1.ComponentStatus, ssSlice []opensearchv1.ComponentStatus) []opensearchv1.ComponentStatus {
 	for idx, v := range ssSlice {
 		if ComponentStatusEqual(v, ss) {
 			return append(ssSlice[0:idx], ssSlice[idx+1:]...)
@@ -58,21 +210,21 @@ func RemoveIt(ss opsterv1.ComponentStatus, ssSlice []opsterv1.ComponentStatus) [
 	return ssSlice
 }
 
-func Replace(remove opsterv1.ComponentStatus, add opsterv1.ComponentStatus, ssSlice []opsterv1.ComponentStatus) []opsterv1.ComponentStatus {
+func Replace(remove opensearchv1.ComponentStatus, add opensearchv1.ComponentStatus, ssSlice []opensearchv1.ComponentStatus) []opensearchv1.ComponentStatus {
 	removedSlice := RemoveIt(remove, ssSlice)
 	fullSliced := append(removedSlice, add)
 	return fullSliced
 }
 
-func ComponentStatusEqual(left opsterv1.ComponentStatus, right opsterv1.ComponentStatus) bool {
+func ComponentStatusEqual(left opensearchv1.ComponentStatus, right opensearchv1.ComponentStatus) bool {
 	return left.Component == right.Component && left.Description == right.Description && left.Status == right.Status
 }
 
 func FindFirstPartial(
-	arr []opsterv1.ComponentStatus,
-	item opsterv1.ComponentStatus,
-	predicator func(opsterv1.ComponentStatus, opsterv1.ComponentStatus) (opsterv1.ComponentStatus, bool),
-) (opsterv1.ComponentStatus, bool) {
+	arr []opensearchv1.ComponentStatus,
+	item opensearchv1.ComponentStatus,
+	predicator func(opensearchv1.ComponentStatus, opensearchv1.ComponentStatus) (opensearchv1.ComponentStatus, bool),
+) (opensearchv1.ComponentStatus, bool) {
 	for i := 0; i < len(arr); i++ {
 		itemInArr, found := predicator(arr[i], item)
 		if found {
@@ -83,11 +235,11 @@ func FindFirstPartial(
 }
 
 func FindAllPartial(
-	arr []opsterv1.ComponentStatus,
-	item opsterv1.ComponentStatus,
-	predicator func(opsterv1.ComponentStatus, opsterv1.ComponentStatus) (opsterv1.ComponentStatus, bool),
-) []opsterv1.ComponentStatus {
-	var result []opsterv1.ComponentStatus
+	arr []opensearchv1.ComponentStatus,
+	item opensearchv1.ComponentStatus,
+	predicator func(opensearchv1.ComponentStatus, opensearchv1.ComponentStatus) (opensearchv1.ComponentStatus, bool),
+) []opensearchv1.ComponentStatus {
+	var result []opensearchv1.ComponentStatus
 
 	for i := 0; i < len(arr); i++ {
 		itemInArr, found := predicator(arr[i], item)
@@ -116,33 +268,232 @@ func FindByPath(obj interface{}, keys []string) (interface{}, bool) {
 	return val, ok
 }
 
-func UsernameAndPassword(k8sClient k8s.K8sClient, cr *opsterv1.OpenSearchCluster) (string, string, error) {
+func EnsureAdminCredentialsSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster) (*corev1.Secret, bool, error) {
+	// Check if user provided AdminCredentialsSecret via Security.Config
 	if cr.Spec.Security != nil && cr.Spec.Security.Config != nil && cr.Spec.Security.Config.AdminCredentialsSecret.Name != "" {
-		// Read credentials from secret
-		credentialsSecret, err := k8sClient.GetSecret(cr.Spec.Security.Config.AdminCredentialsSecret.Name, cr.Namespace)
-		if err != nil {
-			return "", "", err
-		}
-		username, usernameExists := credentialsSecret.Data["username"]
-		password, passwordExists := credentialsSecret.Data["password"]
-		if !usernameExists || !passwordExists {
-			return "", "", errors.New("username or password field missing")
-		}
-		return string(username), string(password), nil
-	} else {
-		// Use default demo credentials
-		return "admin", "admin", nil
+		secret, err := k8sClient.GetSecret(cr.Spec.Security.Config.AdminCredentialsSecret.Name, cr.Namespace)
+		return &secret, false, err
 	}
+
+	// Always generate/administer the admin credentials secret
+	generatedName := GeneratedAdminCredentialsSecretName(cr)
+	secret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+	if err == nil {
+		return &secret, true, nil
+	}
+	if !k8serrors.IsNotFound(err) {
+		return nil, true, err
+	}
+
+	randomPassword := rand.Text()
+
+	adminSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      generatedName,
+			Namespace: cr.Namespace,
+		},
+		StringData: map[string]string{
+			"username": "admin",
+			"password": randomPassword,
+		},
+	}
+	if _, err := k8sClient.CreateSecret(adminSecret); err != nil {
+		return nil, true, err
+	}
+
+	createdSecret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+	if err != nil {
+		return nil, true, err
+	}
+	return &createdSecret, true, nil
 }
 
-func GetByDescriptionAndComponent(left opsterv1.ComponentStatus, right opsterv1.ComponentStatus) (opsterv1.ComponentStatus, bool) {
+func BuildGeneratedSecurityConfigSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster, adminSecret *corev1.Secret) (*corev1.Secret, error) {
+	baseData, err := defaultSecurityconfigData()
+	if err != nil {
+		return nil, err
+	}
+
+	if cr.Spec.Security != nil && cr.Spec.Security.Config != nil && cr.Spec.Security.Config.SecurityconfigSecret.Name != "" {
+		userSecret, err := k8sClient.GetSecret(cr.Spec.Security.Config.SecurityconfigSecret.Name, cr.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range userSecret.Data {
+			baseData[key] = append([]byte(nil), value...)
+		}
+	}
+
+	adminPassword, passwordExists := adminSecret.Data["password"]
+	if !passwordExists {
+		return nil, errors.New("admin credentials secret missing password field")
+	}
+
+	dashboardsSecret, _, err := EnsureDashboardsCredentialsSecret(k8sClient, cr)
+	if err != nil {
+		return nil, err
+	}
+	var dashboardsPassword []byte
+	if dashboardsSecret != nil {
+		if pwd, exists := dashboardsSecret.Data["password"]; exists {
+			dashboardsPassword = pwd
+		}
+	}
+	if len(dashboardsPassword) == 0 {
+		return nil, errors.New("dashboards credentials secret missing password field")
+	}
+
+	internalUsers, ok := baseData["internal_users.yml"]
+	if !ok {
+		return nil, errors.New("securityconfig missing internal_users.yml")
+	}
+
+	generatedName := GeneratedSecurityConfigSecretName(cr)
+	var existingGenerated *corev1.Secret
+	existingSecret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+	if err == nil {
+		existingGenerated = &existingSecret
+	} else if !k8serrors.IsNotFound(err) {
+		return nil, err
+	}
+
+	var adminHashOverride, dashboardsHashOverride string
+	if existingGenerated != nil {
+		if existingInternal, exists := existingGenerated.Data["internal_users.yml"]; exists {
+			var existingConfig InternalUserConfig
+			if err := yaml.Unmarshal(existingInternal, &existingConfig); err == nil {
+				if existingConfig.Admin.Hash != "" && bcrypt.CompareHashAndPassword([]byte(existingConfig.Admin.Hash), adminPassword) == nil {
+					adminHashOverride = existingConfig.Admin.Hash
+				}
+				if existingConfig.Kibanaserver != nil && existingConfig.Kibanaserver.Hash != "" {
+					if bcrypt.CompareHashAndPassword([]byte(existingConfig.Kibanaserver.Hash), dashboardsPassword) == nil {
+						dashboardsHashOverride = existingConfig.Kibanaserver.Hash
+					}
+				}
+			}
+		}
+	}
+
+	internalUsers, err = applyUserHashes(internalUsers, adminPassword, adminHashOverride, dashboardsPassword, dashboardsHashOverride)
+	if err != nil {
+		return nil, err
+	}
+	baseData["internal_users.yml"] = internalUsers
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      generatedName,
+			Namespace: cr.Namespace,
+		},
+		Data: baseData,
+		Type: corev1.SecretTypeOpaque,
+	}
+
+	return secret, nil
+}
+
+func applyUserHashes(internalUserData []byte, adminPassword []byte, adminHashOverride string, dashboardsPassword []byte, dashboardsHashOverride string) ([]byte, error) {
+	var data InternalUserConfig
+	if err := yaml.Unmarshal(internalUserData, &data); err != nil {
+		return nil, err
+	}
+
+	var adminHash string
+	if adminHashOverride != "" {
+		adminHash = adminHashOverride
+	} else {
+		hashed, err := bcrypt.GenerateFromPassword(adminPassword, 12)
+		if err != nil {
+			return nil, err
+		}
+		adminHash = string(hashed)
+	}
+	data.Admin.Hash = adminHash
+
+	if !data.Admin.Reserved {
+		data.Admin.Reserved = true
+	}
+	if len(data.Admin.BackendRoles) == 0 {
+		data.Admin.BackendRoles = []string{"admin"}
+	} else {
+		found := false
+		for _, role := range data.Admin.BackendRoles {
+			if role == "admin" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			data.Admin.BackendRoles = append(data.Admin.BackendRoles, "admin")
+		}
+	}
+
+	if data.Kibanaserver == nil {
+		data.Kibanaserver = &User{}
+	}
+
+	var dashboardsHash string
+	if dashboardsHashOverride != "" {
+		dashboardsHash = dashboardsHashOverride
+	} else {
+		hashed, err := bcrypt.GenerateFromPassword(dashboardsPassword, 12)
+		if err != nil {
+			return nil, err
+		}
+		dashboardsHash = string(hashed)
+	}
+	data.Kibanaserver.Hash = dashboardsHash
+	if !data.Kibanaserver.Reserved {
+		data.Kibanaserver.Reserved = true
+	}
+	if data.Kibanaserver.Description == "" {
+		data.Kibanaserver.Description = "Demo user for the OpenSearch Dashboards server"
+	}
+
+	modifiedYaml, err := yaml.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	return modifiedYaml, nil
+}
+
+func UsernameAndPassword(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster) (string, string, error) {
+	// Check if user provided AdminCredentialsSecret via Security.Config
+	var secretName string
+	if cr.Spec.Security != nil && cr.Spec.Security.Config != nil && cr.Spec.Security.Config.AdminCredentialsSecret.Name != "" {
+		secretName = cr.Spec.Security.Config.AdminCredentialsSecret.Name
+	} else {
+		secretName = GeneratedAdminCredentialsSecretName(cr)
+	}
+
+	credentialsSecret, err := k8sClient.GetSecret(secretName, cr.Namespace)
+	if err != nil {
+		if k8serrors.IsNotFound(err) && secretName == GeneratedAdminCredentialsSecretName(cr) {
+			credentialsSecretPtr, _, createErr := EnsureAdminCredentialsSecret(k8sClient, cr)
+			if createErr != nil {
+				return "", "", createErr
+			}
+			credentialsSecret = *credentialsSecretPtr
+		} else {
+			return "", "", err
+		}
+	}
+	username, usernameExists := credentialsSecret.Data["username"]
+	password, passwordExists := credentialsSecret.Data["password"]
+	if !usernameExists || !passwordExists {
+		return "", "", errors.New("username or password field missing")
+	}
+	return string(username), string(password), nil
+}
+
+func GetByDescriptionAndComponent(left opensearchv1.ComponentStatus, right opensearchv1.ComponentStatus) (opensearchv1.ComponentStatus, bool) {
 	if left.Description == right.Description && left.Component == right.Component {
 		return left, true
 	}
 	return right, false
 }
 
-func GetByComponent(left opsterv1.ComponentStatus, right opsterv1.ComponentStatus) (opsterv1.ComponentStatus, bool) {
+func GetByComponent(left opensearchv1.ComponentStatus, right opensearchv1.ComponentStatus) (opensearchv1.ComponentStatus, bool) {
 	if left.Component == right.Component {
 		return left, true
 	}
@@ -150,13 +501,14 @@ func GetByComponent(left opsterv1.ComponentStatus, right opsterv1.ComponentStatu
 }
 
 func MergeConfigs(left map[string]string, right map[string]string) map[string]string {
-	if left == nil {
-		return right
+	result := make(map[string]string)
+	for k, v := range left {
+		result[k] = v
 	}
 	for k, v := range right {
-		left[k] = v
+		result[k] = v
 	}
-	return left
+	return result
 }
 
 // Return the keys of the input map in sorted order
@@ -247,7 +599,7 @@ func DiffSlice(leftSlice, rightSlice []string) []string {
 }
 
 // Count the number of pods running and ready and not terminating for a given nodePool
-func CountRunningPodsForNodePool(k8sClient k8s.K8sClient, cr *opsterv1.OpenSearchCluster, nodePool *opsterv1.NodePool) (int, error) {
+func CountRunningPodsForNodePool(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster, nodePool *opensearchv1.NodePool) (int, error) {
 	// Constrict selector from labels
 	clusterReq, err := labels.NewRequirement(ClusterLabel, selection.Equals, []string{cr.Name})
 	if err != nil {
@@ -282,8 +634,17 @@ func CountRunningPodsForNodePool(k8sClient k8s.K8sClient, cr *opsterv1.OpenSearc
 	return numReadyPods, nil
 }
 
+// ReadyReplicasForNodePool returns the number of ready replicas derived from the actual running pods.
+func ReadyReplicasForNodePool(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster, nodePool *opensearchv1.NodePool) (int32, error) {
+	numReadyPods, err := CountRunningPodsForNodePool(k8sClient, cr, nodePool)
+	if err != nil {
+		return 0, err
+	}
+	return int32(numReadyPods), nil
+}
+
 // Count the number of PVCs created for the given NodePool
-func CountPVCsForNodePool(k8sClient k8s.K8sClient, cr *opsterv1.OpenSearchCluster, nodePool *opsterv1.NodePool) (int, error) {
+func CountPVCsForNodePool(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster, nodePool *opensearchv1.NodePool) (int, error) {
 	clusterReq, err := labels.NewRequirement(ClusterLabel, selection.Equals, []string{cr.Name})
 	if err != nil {
 		return 0, err
@@ -302,57 +663,67 @@ func CountPVCsForNodePool(k8sClient k8s.K8sClient, cr *opsterv1.OpenSearchCluste
 }
 
 // Delete a STS with cascade=orphan and wait until it is actually deleted from the kubernetes API
-func WaitForSTSDelete(k8sClient k8s.K8sClient, obj *appsv1.StatefulSet) error {
+func WaitForSTSDelete(ctx context.Context, k8sClient k8s.K8sClient, obj *appsv1.StatefulSet) error {
+	cond := func(ctx context.Context) (bool, error) {
+		_, err := k8sClient.GetStatefulSet(obj.Name, obj.Namespace)
+		if k8serrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
 	if err := k8sClient.DeleteStatefulSet(obj, true); err != nil {
 		return err
 	}
-	for i := 1; i <= stsUpdateWaitTime/updateStepTime; i++ {
-		_, err := k8sClient.GetStatefulSet(obj.Name, obj.Namespace)
-		if err != nil {
-			return nil
-		}
-		time.Sleep(time.Second * updateStepTime)
-	}
-	return fmt.Errorf("failed to delete STS")
+	return wait.PollUntilContextTimeout(ctx, time.Second*updateStepTime, time.Second*stsUpdateWaitTime, true, cond)
 }
 
 // Wait for max 30s until a STS has at least the given number of replicas
-func WaitForSTSReplicas(k8sClient k8s.K8sClient, obj *appsv1.StatefulSet, replicas int32) error {
-	for i := 1; i <= stsUpdateWaitTime/updateStepTime; i++ {
+func WaitForSTSReplicas(ctx context.Context, k8sClient k8s.K8sClient, obj *appsv1.StatefulSet, replicas int32) error {
+	cond := func(ctx context.Context) (bool, error) {
 		existing, err := k8sClient.GetStatefulSet(obj.Name, obj.Namespace)
-		if err == nil {
-			if existing.Status.Replicas >= replicas {
-				return nil
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				return false, nil
 			}
+			return false, err
 		}
-		time.Sleep(time.Second * updateStepTime)
+		if existing.Status.Replicas >= replicas {
+			return true, nil
+		}
+		return false, nil
 	}
-	return fmt.Errorf("failed to wait for replicas")
+	return wait.PollUntilContextTimeout(ctx, time.Second*updateStepTime, time.Second*stsUpdateWaitTime, true, cond)
 }
 
-// Wait for max 30s until a STS has a normal status (CurrentRevision != "")
-func WaitForSTSStatus(k8sClient k8s.K8sClient, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
-	for i := 1; i <= stsUpdateWaitTime/updateStepTime; i++ {
+func WaitForSTSStatus(ctx context.Context, k8sClient k8s.K8sClient, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
+	var result appsv1.StatefulSet
+	cond := func(ctx context.Context) (bool, error) {
 		existing, err := k8sClient.GetStatefulSet(obj.Name, obj.Namespace)
-		if err == nil {
-			if existing.Status.CurrentRevision != "" {
-				return &existing, nil
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				return false, nil
 			}
+			return false, err
 		}
-		time.Sleep(time.Second * updateStepTime)
+		result = existing
+		if existing.Status.CurrentRevision != "" {
+			return true, nil
+		}
+		return false, nil
 	}
-	return nil, fmt.Errorf("failed to wait for STS")
+	err := wait.PollUntilContextTimeout(ctx, time.Second*updateStepTime, time.Second*stsUpdateWaitTime, true, cond)
+	return &result, err
 }
 
 // GetSTSForNodePool returns the corresponding sts for a given nodePool and cluster name
-func GetSTSForNodePool(k8sClient k8s.K8sClient, nodePool opsterv1.NodePool, clusterName, clusterNamespace string) (*appsv1.StatefulSet, error) {
+func GetSTSForNodePool(k8sClient k8s.K8sClient, nodePool opensearchv1.NodePool, clusterName, clusterNamespace string) (*appsv1.StatefulSet, error) {
 	stsName := clusterName + "-" + nodePool.Component
 	existing, err := k8sClient.GetStatefulSet(stsName, clusterNamespace)
 	return &existing, err
 }
 
 // DeleteSTSForNodePool deletes the sts for the corresponding nodePool
-func DeleteSTSForNodePool(k8sClient k8s.K8sClient, nodePool opsterv1.NodePool, clusterName, clusterNamespace string) error {
+func DeleteSTSForNodePool(ctx context.Context, k8sClient k8s.K8sClient, nodePool opensearchv1.NodePool, clusterName, clusterNamespace string) error {
 	sts, err := GetSTSForNodePool(k8sClient, nodePool, clusterName, clusterNamespace)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -365,16 +736,16 @@ func DeleteSTSForNodePool(k8sClient k8s.K8sClient, nodePool opsterv1.NodePool, c
 		return err
 	}
 
-	// Wait for the STS to actually be deleted
-	for i := 1; i <= stsUpdateWaitTime/updateStepTime; i++ {
-		_, err := k8sClient.GetStatefulSet(sts.Name, sts.Namespace)
-		if err != nil {
-			return nil
-		}
-		time.Sleep(time.Second * updateStepTime)
-	}
-
-	return fmt.Errorf("failed to delete STS for nodepool %s", nodePool.Component)
+	// Wait for the STS to actually be deleted using context-aware polling
+	return wait.PollUntilContextTimeout(ctx, time.Second*updateStepTime, time.Second*stsUpdateWaitTime, true,
+		func(ctx context.Context) (bool, error) {
+			_, err := k8sClient.GetStatefulSet(sts.Name, sts.Namespace)
+			if k8serrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		},
+	)
 }
 
 // DeleteSecurityUpdateJob deletes the securityconfig update job
@@ -391,11 +762,11 @@ func DeleteSecurityUpdateJob(k8sClient k8s.K8sClient, clusterName, clusterNamesp
 	return k8sClient.DeleteJob(&job)
 }
 
-func HasDataRole(nodePool *opsterv1.NodePool) bool {
+func HasDataRole(nodePool *opensearchv1.NodePool) bool {
 	return ContainsString(nodePool.Roles, "data")
 }
 
-func HasManagerRole(nodePool *opsterv1.NodePool) bool {
+func HasManagerRole(nodePool *opensearchv1.NodePool) bool {
 	return ContainsString(nodePool.Roles, "master") || ContainsString(nodePool.Roles, "cluster_manager")
 }
 
@@ -418,15 +789,23 @@ func CompareVersions(v1 string, v2 string) bool {
 	return err == nil && ver1.LessThan(ver2)
 }
 
-func ComposePDB(cr *opsterv1.OpenSearchCluster, nodepool *opsterv1.NodePool) policyv1.PodDisruptionBudget {
+func ComposePDB(cr *opensearchv1.OpenSearchCluster, nodepool *opensearchv1.NodePool) policyv1.PodDisruptionBudget {
+	if cr == nil || nodepool == nil {
+		return policyv1.PodDisruptionBudget{}
+	}
+
+	clusterName := cr.Name
+	namespace := cr.Namespace
+	component := nodepool.Component
+
 	matchLabels := map[string]string{
-		ClusterLabel:  cr.Name,
-		NodePoolLabel: nodepool.Component,
+		ClusterLabel:  clusterName,
+		NodePoolLabel: component,
 	}
 	newpdb := policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-" + nodepool.Component + "-pdb",
-			Namespace: cr.Namespace,
+			Name:      clusterName + "-" + component + "-pdb",
+			Namespace: namespace,
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable:   nodepool.Pdb.MinAvailable,
@@ -439,29 +818,27 @@ func ComposePDB(cr *opsterv1.OpenSearchCluster, nodepool *opsterv1.NodePool) pol
 	return newpdb
 }
 
-func CalculateJvmHeapSize(nodePool *opsterv1.NodePool) string {
-	jvmHeapSizeTemplate := "-Xmx%s -Xms%s"
-
-	if nodePool.Jvm == "" {
-		memoryLimit := nodePool.Resources.Requests.Memory()
-
-		// Memory request is not present
-		if memoryLimit.IsZero() {
-			return fmt.Sprintf(jvmHeapSizeTemplate, "512M", "512M")
-		}
-
-		// Set Java Heap size to half of the node pool memory size
-		megabytes := float64((memoryLimit.Value() / 2) / 1024.0 / 1024.0)
-
-		heapSize := fmt.Sprintf("%vM", megabytes)
-		return fmt.Sprintf(jvmHeapSizeTemplate, heapSize, heapSize)
+func AppendJvmHeapSizeSettings(jvm string, heapSizeSettings string) string {
+	if strings.Contains(jvm, "Xms") || strings.Contains(jvm, "Xmx") {
+		return jvm
 	}
-
-	return nodePool.Jvm
+	if jvm == "" {
+		return heapSizeSettings
+	}
+	return fmt.Sprintf("%s %s", jvm, heapSizeSettings)
 }
 
-func IsUpgradeInProgress(status opsterv1.ClusterStatus) bool {
-	componentStatus := opsterv1.ComponentStatus{
+func CalculateJvmHeapSizeSettings(memoryRequest *resource.Quantity) string {
+	var memoryRequestMb int64 = 512
+	if memoryRequest != nil && !memoryRequest.IsZero() {
+		memoryRequestMb = ((memoryRequest.Value() / 2.0) / 1024.0) / 1024.0
+	}
+	// Set Java Heap size to half of the node pool memory request for both Xms and Xmx
+	return fmt.Sprintf("-Xms%dM -Xmx%dM", memoryRequestMb, memoryRequestMb)
+}
+
+func IsUpgradeInProgress(status opensearchv1.ClusterStatus) bool {
+	componentStatus := opensearchv1.ComponentStatus{
 		Component: "Upgrader",
 	}
 	foundStatus := FindAllPartial(status.ComponentsStatus, componentStatus, GetByComponent)
@@ -540,7 +917,7 @@ func GetDashboardsDeployment(k8sClient k8s.K8sClient, clusterName, clusterNamesp
 }
 
 // DeleteDashboardsDeployment deletes the OSD deployment along with all its pods
-func DeleteDashboardsDeployment(k8sClient k8s.K8sClient, clusterName, clusterNamespace string) error {
+func DeleteDashboardsDeployment(ctx context.Context, k8sClient k8s.K8sClient, clusterName, clusterNamespace string) error {
 	deploy, err := GetDashboardsDeployment(k8sClient, clusterName, clusterNamespace)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -553,21 +930,124 @@ func DeleteDashboardsDeployment(k8sClient k8s.K8sClient, clusterName, clusterNam
 		return err
 	}
 
-	// Wait for Dashboards deploy to delete
-	// We can use the same waiting time for sts as both have same termination grace period
-	for i := 1; i <= stsUpdateWaitTime/updateStepTime; i++ {
-		_, err := k8sClient.GetDeployment(deploy.Name, clusterNamespace)
-		if err != nil {
-			return nil
-		}
-		time.Sleep(time.Second * updateStepTime)
-	}
-
-	return fmt.Errorf("failed to delete dashboards deployment for cluster %s", clusterName)
+	// Wait for Dashboards deploy to delete using context-aware polling
+	return wait.PollUntilContextTimeout(ctx, time.Second*updateStepTime, time.Second*stsUpdateWaitTime, true,
+		func(ctx context.Context) (bool, error) {
+			_, err := k8sClient.GetDeployment(deploy.Name, clusterNamespace)
+			if k8serrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		},
+	)
 }
 
 func SafeClose(c io.Closer) {
 	if err := c.Close(); err != nil {
 		log.Println("SafeClose error:", err)
 	}
+}
+
+// ResolveUidGid resolves the UID and GID using security context hierarchy
+// Priority: securityContext.runAsUser/Group > podSecurityContext.runAsUser/Group > defaults (1000:1000)
+func ResolveUidGid(cr *opensearchv1.OpenSearchCluster) (uid, gid int64) {
+	uid = DefaultUID
+	gid = DefaultGID
+
+	if cr.Spec.General.SecurityContext != nil && cr.Spec.General.SecurityContext.RunAsUser != nil {
+		uid = *cr.Spec.General.SecurityContext.RunAsUser
+	} else if cr.Spec.General.PodSecurityContext != nil && cr.Spec.General.PodSecurityContext.RunAsUser != nil {
+		uid = *cr.Spec.General.PodSecurityContext.RunAsUser
+	}
+
+	if cr.Spec.General.SecurityContext != nil && cr.Spec.General.SecurityContext.RunAsGroup != nil {
+		gid = *cr.Spec.General.SecurityContext.RunAsGroup
+	} else if cr.Spec.General.PodSecurityContext != nil && cr.Spec.General.PodSecurityContext.RunAsGroup != nil {
+		gid = *cr.Spec.General.PodSecurityContext.RunAsGroup
+	}
+
+	return uid, gid
+}
+
+// GetChownCommand creates a chown command with the given UID, GID, and path
+func GetChownCommand(uid, gid int64, path string) string {
+	return fmt.Sprintf("chown -R %d:%d %s", uid, gid, path)
+}
+
+// GenComponentTemplateName generates the component template name from the resource
+func GenComponentTemplateName(template *opensearchv1.OpensearchComponentTemplate) string {
+	if template.Spec.Name != "" {
+		return template.Spec.Name
+	}
+	return template.Name
+}
+
+// GenIndexTemplateName generates the index template name from the resource
+func GenIndexTemplateName(template *opensearchv1.OpensearchIndexTemplate) string {
+	if template.Spec.Name != "" {
+		return template.Spec.Name
+	}
+	return template.Name
+}
+
+func DiscoverRandomAdminSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster) (*corev1.Secret, error) {
+	if cr.Spec.Security == nil || cr.Spec.Security.Config == nil {
+		return nil, fmt.Errorf("security config is not defined")
+	}
+	if cr.Spec.Security.Config.AdminCredentialsSecret.Name != "" {
+		return nil, fmt.Errorf("admin credentials secret managed by user")
+	}
+	secret, err := k8sClient.GetSecret(GeneratedAdminCredentialsSecretName(cr), cr.Namespace)
+	return &secret, err
+}
+
+func DiscoverRandomContextSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster) (*corev1.Secret, error) {
+	secret, err := k8sClient.GetSecret(GeneratedSecurityConfigSecretName(cr), cr.Namespace)
+	return &secret, err
+}
+
+// EnsureDashboardsCredentialsSecret ensures a credentials secret exists for Dashboards.
+// It generates a separate password for Dashboards (not the admin password).
+func EnsureDashboardsCredentialsSecret(k8sClient k8s.K8sClient, cr *opensearchv1.OpenSearchCluster) (*corev1.Secret, bool, error) {
+	// Check if user provided OpensearchCredentialsSecret via Dashboards config
+	if cr.Spec.Dashboards.OpensearchCredentialsSecret.Name != "" {
+		secret, err := k8sClient.GetSecret(cr.Spec.Dashboards.OpensearchCredentialsSecret.Name, cr.Namespace)
+		return &secret, false, err
+	}
+
+	// Always generate/administer the Dashboards credentials secret
+	generatedName := GeneratedDashboardsCredentialsSecretName(cr)
+	secret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+	if err == nil {
+		return &secret, true, nil
+	}
+	if !k8serrors.IsNotFound(err) {
+		return nil, true, err
+	}
+
+	randomPassword := rand.Text()
+	// NOTE(joseb): we cannot set random password when security plugin is disabled.
+	if !IsSecurityPluginEnabled(cr) {
+		randomPassword = "kibanaserver"
+	}
+
+	dashboardsSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      generatedName,
+			Namespace: cr.Namespace,
+		},
+		StringData: map[string]string{
+			"username": "kibanaserver",
+			"password": randomPassword,
+		},
+	}
+	if _, err := k8sClient.CreateSecret(dashboardsSecret); err != nil {
+		return nil, true, err
+	}
+
+	createdSecret, err := k8sClient.GetSecret(generatedName, cr.Namespace)
+	if err != nil {
+		return nil, true, err
+	}
+	return &createdSecret, true, nil
 }

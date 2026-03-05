@@ -5,35 +5,9 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - apps
-  resources:
-  - deployments
-  - statefulsets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - batch
-  resources:
-  - jobs
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
   - ""
   resources:
   - configmaps
-  - namespaces
   - persistentvolumeclaims
   - pods
   - secrets
@@ -55,6 +29,32 @@ rules:
   - patch
   - update
 - apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  - statefulsets/status
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - monitoring.coreos.com
   resources:
   - servicemonitors
@@ -68,13 +68,7 @@ rules:
   - watch
 - apiGroups:
   - opensearch.opster.io
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - opensearch.opster.io
+  - opensearch.org
   resources:
   - opensearchactiongroups
   - opensearchclusters
@@ -96,6 +90,7 @@ rules:
   - watch
 - apiGroups:
   - opensearch.opster.io
+  - opensearch.org
   resources:
   - opensearchactiongroups/finalizers
   - opensearchclusters/finalizers
@@ -111,6 +106,7 @@ rules:
   - update
 - apiGroups:
   - opensearch.opster.io
+  - opensearch.org
   resources:
   - opensearchactiongroups/status
   - opensearchclusters/status

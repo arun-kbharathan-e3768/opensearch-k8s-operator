@@ -3,22 +3,22 @@ package util
 import (
 	"context"
 
-	opsterv1 "github.com/Opster/opensearch-k8s-operator/opensearch-operator/api/v1"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/mocks/github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/mocks/github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
 	v1 "k8s.io/api/core/v1"
 )
 
 var _ = Describe("Additional volumes", func() {
 	namespace := "Additional volume test"
-	var volumeConfigs []opsterv1.AdditionalVolume
+	var volumeConfigs []opensearchv1.AdditionalVolume
 	var mockClient *k8s.MockK8sClient
 
 	BeforeEach(func() {
 		mockClient = k8s.NewMockK8sClient(GinkgoT())
 		mockClient.EXPECT().Context().Return(context.Background())
-		volumeConfigs = []opsterv1.AdditionalVolume{
+		volumeConfigs = []opensearchv1.AdditionalVolume{
 			{
 				Name: "myVolume",
 				Path: "myPath/a/b",
@@ -154,6 +154,20 @@ var _ = Describe("Additional volumes", func() {
 		})
 	})
 
+	When("PersistentVolumeClaim volume is added", func() {
+		It("Should have PersistentVolumeClaimVolumeSource fields", func() {
+			readOnly := true
+			volumeConfigs[0].PersistentVolumeClaim = &v1.PersistentVolumeClaimVolumeSource{
+				ClaimName: "testClaim",
+				ReadOnly:  readOnly,
+			}
+
+			volume, _, _, _ := CreateAdditionalVolumes(mockClient, namespace, volumeConfigs)
+			Expect(volume[0].PersistentVolumeClaim.ClaimName).To(Equal("testClaim"))
+			Expect(volume[0].PersistentVolumeClaim.ReadOnly).Should(BeTrue())
+		})
+	})
+
 	When("Projected volume is added", func() {
 		It("Should have ProjectedVolumeSource fields", func() {
 			volumeConfigs[0].Projected = &v1.ProjectedVolumeSource{
@@ -198,6 +212,86 @@ var _ = Describe("Additional volumes", func() {
 			_, volumeMount, _, _ := CreateAdditionalVolumes(mockClient, namespace, volumeConfigs)
 			Expect(volumeMount[0].MountPath).To(Equal("myPath/a/b"))
 			Expect(volumeMount[0].SubPath).To(BeEmpty())
+		})
+	})
+
+	When("NFS volume is added", func() {
+		It("Should have NFSVolumeSource fields and mount readOnly", func() {
+			volumeConfigs[0].NFS = &v1.NFSVolumeSource{
+				Server:   "10.0.0.1",
+				Path:     "/export/path",
+				ReadOnly: true,
+			}
+
+			volume, volumeMount, _, _ := CreateAdditionalVolumes(mockClient, namespace, volumeConfigs)
+			Expect(volume[0].NFS.Server).To(Equal("10.0.0.1"))
+			Expect(volume[0].NFS.Path).To(Equal("/export/path"))
+			Expect(volume[0].NFS.ReadOnly).To(BeTrue())
+			Expect(volumeMount[0].MountPath).To(Equal("myPath/a/b"))
+			Expect(volumeMount[0].ReadOnly).To(BeTrue())
+			Expect(volumeMount[0].SubPath).To(BeEmpty())
+
+		})
+	})
+})
+
+var _ = Describe("OpensearchClusterURL", func() {
+	When("HTTP TLS is enabled", func() {
+		It("should return https URL", func() {
+			enabled := true
+			cluster := &opensearchv1.OpenSearchCluster{
+				Spec: opensearchv1.ClusterSpec{
+					General: opensearchv1.GeneralConfig{
+						ServiceName: "test-service",
+						HttpPort:    9200,
+					},
+					Security: &opensearchv1.Security{
+						Tls: &opensearchv1.TlsConfig{
+							Http: &opensearchv1.TlsConfigHttp{
+								Enabled: &enabled,
+							},
+						},
+					},
+				},
+			}
+			cluster.Name = "test-cluster"
+			cluster.Namespace = "test-namespace"
+
+			url := OpensearchClusterURL(cluster)
+			Expect(url).To(ContainSubstring("https://"))
+			Expect(url).To(ContainSubstring("test-service"))
+			Expect(url).To(ContainSubstring("test-namespace"))
+			Expect(url).To(ContainSubstring(":9200"))
+		})
+	})
+
+	When("HTTP TLS is disabled", func() {
+		It("should return http URL", func() {
+			enabled := false
+			cluster := &opensearchv1.OpenSearchCluster{
+				Spec: opensearchv1.ClusterSpec{
+					General: opensearchv1.GeneralConfig{
+						ServiceName: "test-service",
+						HttpPort:    9200,
+					},
+					Security: &opensearchv1.Security{
+						Tls: &opensearchv1.TlsConfig{
+							Http: &opensearchv1.TlsConfigHttp{
+								Enabled: &enabled,
+							},
+						},
+					},
+				},
+			}
+			cluster.Name = "test-cluster"
+			cluster.Namespace = "test-namespace"
+
+			url := OpensearchClusterURL(cluster)
+			Expect(url).To(ContainSubstring("http://"))
+			Expect(url).NotTo(ContainSubstring("https://"))
+			Expect(url).To(ContainSubstring("test-service"))
+			Expect(url).To(ContainSubstring("test-namespace"))
+			Expect(url).To(ContainSubstring(":9200"))
 		})
 	})
 })

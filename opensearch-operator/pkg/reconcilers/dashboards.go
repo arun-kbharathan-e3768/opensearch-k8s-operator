@@ -3,15 +3,16 @@ package reconcilers
 import (
 	"context"
 	"fmt"
+	"time"
 
-	opsterv1 "github.com/Opster/opensearch-k8s-operator/opensearch-operator/api/v1"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/builders"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/helpers"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/util"
-	"github.com/Opster/opensearch-k8s-operator/opensearch-operator/pkg/tls"
-	"github.com/cisco-open/operator-tools/pkg/reconciler"
 	"github.com/go-logr/logr"
+	opensearchv1 "github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/api/opensearch.org/v1"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/builders"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/helpers"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconciler"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/k8s"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/reconcilers/util"
+	"github.com/opensearch-project/opensearch-k8s-operator/opensearch-operator/pkg/tls"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
@@ -24,7 +25,7 @@ type DashboardsReconciler struct {
 	client            k8s.K8sClient
 	recorder          record.EventRecorder
 	reconcilerContext *ReconcilerContext
-	instance          *opsterv1.OpenSearchCluster
+	instance          *opensearchv1.OpenSearchCluster
 	logger            logr.Logger
 	pki               tls.PKI
 }
@@ -34,7 +35,7 @@ func NewDashboardsReconciler(
 	ctx context.Context,
 	recorder record.EventRecorder,
 	reconcilerContext *ReconcilerContext,
-	instance *opsterv1.OpenSearchCluster,
+	instance *opensearchv1.OpenSearchCluster,
 	opts ...reconciler.ResourceReconcilerOption,
 ) *DashboardsReconciler {
 	return &DashboardsReconciler{
@@ -75,6 +76,20 @@ func (r *DashboardsReconciler) Reconcile() (ctrl.Result, error) {
 
 	volumes = append(volumes, addVolumes...)
 	volumeMounts = append(volumeMounts, addVolumeMounts...)
+
+	// Ensure Dashboards credentials secret exists (always generated/administered)
+	// OpensearchCredentialsSecret is optional - check if Name is set
+	if r.instance.Spec.Dashboards.OpensearchCredentialsSecret.Name == "" {
+		dashboardsCredSecret, managedByOperator, err := helpers.EnsureDashboardsCredentialsSecret(r.client, r.instance)
+		if err != nil {
+			r.logger.Error(err, "Unable to ensure Dashboards credentials secret")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 30}, err
+		}
+		if managedByOperator && dashboardsCredSecret != nil {
+			result.CombineErr(ctrl.SetControllerReference(r.instance, dashboardsCredSecret, r.client.Scheme()))
+			result.Combine(r.client.ReconcileResource(dashboardsCredSecret, reconciler.StatePresent))
+		}
+	}
 
 	cm := builders.NewDashboardsConfigMapForCR(r.instance, fmt.Sprintf("%s-dashboards-config", r.instance.Name), r.reconcilerContext.DashboardsConfig)
 	result.CombineErr(ctrl.SetControllerReference(r.instance, cm, r.client.Scheme()))
@@ -139,14 +154,16 @@ func (r *DashboardsReconciler) handleTls() ([]corev1.Volume, []corev1.VolumeMoun
 				fmt.Sprintf("%s-dashboards.%s.svc", clusterName, namespace),
 				fmt.Sprintf("%s-dashboards.%s.svc.%s", clusterName, namespace, helpers.ClusterDnsBase()),
 			}
-
-			// Add additional SANs if specified
-			if len(r.instance.Spec.Dashboards.Tls.AdditionalSANs) > 0 {
-				r.logger.Info("Adding additional SANs to dashboard certificate", "count", len(r.instance.Spec.Dashboards.Tls.AdditionalSANs))
-				dnsNames = append(dnsNames, r.instance.Spec.Dashboards.Tls.AdditionalSANs...)
+			// Append additional SANs if specified
+			if len(tlsConfig.AdditionalSANs) > 0 {
+				r.logger.Info("Adding additional SANs to dashboard certificate", "count", len(tlsConfig.AdditionalSANs))
+				dnsNames = append(dnsNames, tlsConfig.AdditionalSANs...)
 			}
-
-			nodeCert, err := ca.CreateAndSignCertificate(clusterName+"-dashboards", clusterName, dnsNames)
+			validity := 365 * 24 * time.Hour
+			if tlsConfig.Duration != nil {
+				validity = tlsConfig.Duration.Duration
+			}
+			nodeCert, err := ca.CreateAndSignCertificate(clusterName+"-dashboards", clusterName, dnsNames, validity)
 			if err != nil {
 				r.logger.Error(err, "Failed to create tls certificate")
 				r.recorder.AnnotatedEventf(r.instance, annotations, "Warning", "Security", "Failed to store tls certificate for Dashboard Cluster")

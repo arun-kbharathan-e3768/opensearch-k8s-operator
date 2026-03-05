@@ -1,0 +1,10 @@
+manager:
+  image:
+    repository: controller
+    tag: latest
+    pullPolicy: IfNotPresent
+# Enable validation webhooks with cert-manager
+webhook:
+  enabled: true
+  certManager:
+    enabled: true
